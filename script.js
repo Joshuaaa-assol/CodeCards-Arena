@@ -45,10 +45,10 @@ async function pull(lang) { // fetch up to 5 more pages per tag; returns only qu
       let r = await fetch(base, { headers: hdr }).catch(() => null);
       if (!proxy && (!r || r.status === 401 || r.status === 403)) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
       if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: hdr }).catch(() => null);
-      if (!r) throw new Error('Could not reach QuizAPI (network or CORS problem)');
+      if (!r) throw new Error(proxy ? 'Could not reach the quiz function in Supabase. Deploy the Edge Function named "quiz" and turn off Verify JWT' : 'Could not reach QuizAPI (network or CORS problem)');
       if (r.status === 401 || r.status === 403) throw new Error(proxy ? 'The question function rejected the request (turn off Verify JWT for it in Supabase)' : 'QuizAPI rejected your API key. Check it in Settings');
       if (r.status === 429) throw new Error('QuizAPI rate limit reached. Try again later');
-      if (r.status === 404) { offs[tag] = -1; break; }
+      if (r.status === 404) { if (proxy && /not found/i.test(await r.clone().text().catch(() => '')) && /function/i.test(await r.clone().text().catch(() => ''))) throw new Error('The quiz function is not deployed in Supabase yet'); offs[tag] = -1; break; }
       if (!r.ok) throw new Error('QuizAPI returned HTTP ' + r.status);
       const j = await r.json().catch(() => null), arr = Array.isArray(j) ? j : j?.data?.questions || j?.data || j?.questions || j?.results;
       if (!Array.isArray(arr)) throw new Error('QuizAPI sent a response in an unexpected format');
@@ -99,7 +99,8 @@ function toast(msg) { const t = document.createElement('div'); t.textContent = m
 function applyPrefs() { const u = me(); document.documentElement.dataset.theme = u.theme; document.body.classList.toggle('noanim', !u.anim); }
 
 // ---------- Supabase (optional): accounts (Auth) + global leaderboard through REST, no extra library ----------
-const SB = window.CCA_CONFIG?.supabaseUrl && window.CCA_CONFIG?.supabaseAnonKey ? { url: window.CCA_CONFIG.supabaseUrl.replace(/\/$/, ''), key: window.CCA_CONFIG.supabaseAnonKey } : null;
+// The Supabase URL and publishable key are public by design (Row Level Security protects the data), so they are built in. config files can override them.
+const SB = { url: (window.CCA_CONFIG?.supabaseUrl || 'https://tnjnvrgfasophahwbhqu.supabase.co').replace(/\/$/, ''), key: window.CCA_CONFIG?.supabaseAnonKey || 'sb_publishable_W34kwVhB8qI8KqBKp7eLqg_hVW43MGz' };
 let auth = null; try { auth = JSON.parse(localStorage.getItem('cca.auth')); } catch {}
 const saveAuth = a => { auth = a; a ? localStorage.setItem('cca.auth', JSON.stringify(a)) : localStorage.removeItem('cca.auth'); };
 async function authCall(path, body) {
