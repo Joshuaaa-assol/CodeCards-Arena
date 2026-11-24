@@ -11,7 +11,7 @@ const day = (d = new Date()) => d.toISOString().slice(0, 10);
 // ---- QuizAPI service: real multiple-choice programming questions, filtered by language tag (needs a free API key) ----
 const DIFF_R = { easy: 900, medium: 1300, hard: 1700 }; // opponent rating used by Elo
 const TTL = 6 * 36e5, KEYNAME = 'cca.key';
-const DEFAULT_KEY = 'qa_sk_f23581d5462d71e9290d4e7d7a5ab8cb7cffde32'; // built-in key; a key saved in Settings overrides it
+const DEFAULT_KEY = window.CCA_CONFIG?.quizApiKey || ''; // comes from config.js (git-ignored); a key saved in Settings overrides it
 const apiKey = () => localStorage.getItem(KEYNAME) || DEFAULT_KEY;
 const TAGS = { Java: ['java'], Python: ['python'], JavaScript: ['javascript'], 'C++': ['c++', 'cpp'], C: ['c'], 'HTML/CSS': ['html', 'css'], SQL: ['sql', 'mysql'] };
 const shuffle = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
@@ -31,34 +31,43 @@ function parseQ(x) { // accepts QuizAPI's legacy and current shapes; single-corr
   }
   if (opts.length < 2 || ci < 0 || ci >= opts.length || opts.some(o => !o)) return null;
   const d = String(x.difficulty || 'medium').toLowerCase();
-  const tags = [...new Set((Array.isArray(x.tags) ? x.tags : []).map(t => String(typeof t === 'string' ? t : t?.name || '').toLowerCase().trim()).filter(Boolean))];
+  const raw = [...(Array.isArray(x.tags) ? x.tags : []), x.category, x.categoryName, x.topic], tags = [...new Set(raw.map(t => String(typeof t === 'string' ? t : t?.name || '').toLowerCase().trim()).filter(t => t && !['code', 'programming', 'null', 'undefined'].includes(t)))];
   return { q: text, correct: opts[ci], opts: shuffle(opts), diff: DIFF_R[d] ? d : 'medium', tags };
 }
-const quizMem = {};
-async function getQuiz(lang) {
-  if (quizMem[lang]) return quizMem[lang];
-  try { const c = JSON.parse(localStorage.getItem('cca.q2.' + lang)); if (c && Date.now() - c.t < TTL && c.q?.length) return (quizMem[lang] = c.q); } catch {}
+const quizMem = {}, quizOff = {}; // question pool per language, and how far we've paged through each tag
+async function pull(lang) { // fetch up to 5 more pages per tag; returns only questions we don't have yet
   const key = apiKey(); if (!key) throw new Error('NOKEY');
-  const all = [];
+  const offs = quizOff[lang] ??= JSON.parse(localStorage.getItem('cca.off3.' + lang) || '{}'), have = new Set((quizMem[lang] || []).map(x => x.q)), got = [];
   for (const tag of TAGS[lang]) {
-    const base = `https://quizapi.io/api/v1/questions?tags=${encodeURIComponent(tag)}&limit=50`;
-    let r = await fetch(base, { headers: { Authorization: 'Bearer ' + key } }).catch(() => null);
-    if (!r || r.status === 401 || r.status === 403) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
-    if (!r) throw new Error('Could not reach QuizAPI (network or CORS problem)');
-    if (r.status === 401 || r.status === 403) throw new Error('QuizAPI rejected your API key. Check it in Settings');
-    if (r.status === 429) throw new Error('QuizAPI rate limit reached. Try again later');
-    if (r.status === 404) continue;
-    if (!r.ok) throw new Error('QuizAPI returned HTTP ' + r.status);
-    const j = await r.json().catch(() => null), arr = Array.isArray(j) ? j : j?.data?.questions || j?.data || j?.questions || j?.results;
-    if (!Array.isArray(arr)) throw new Error('QuizAPI sent a response in an unexpected format');
-    all.push(...arr.map(parseQ).filter(Boolean));
+    for (let page = 0; page < 5 && offs[tag] !== -1; page++) {
+      const off = offs[tag] || 0, base = `https://quizapi.io/api/v1/questions?tags=${encodeURIComponent(tag)}&limit=50&offset=${off}`;
+      let r = await fetch(base, { headers: { Authorization: 'Bearer ' + key } }).catch(() => null);
+      if (!r || r.status === 401 || r.status === 403) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
+      if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: { Authorization: 'Bearer ' + key } }).catch(() => null);
+      if (!r) throw new Error('Could not reach QuizAPI (network or CORS problem)');
+      if (r.status === 401 || r.status === 403) throw new Error('QuizAPI rejected your API key. Check it in Settings');
+      if (r.status === 429) throw new Error('QuizAPI rate limit reached. Try again later');
+      if (r.status === 404) { offs[tag] = -1; break; }
+      if (!r.ok) throw new Error('QuizAPI returned HTTP ' + r.status);
+      const j = await r.json().catch(() => null), arr = Array.isArray(j) ? j : j?.data?.questions || j?.data || j?.questions || j?.results;
+      if (!Array.isArray(arr)) throw new Error('QuizAPI sent a response in an unexpected format');
+      const fresh = arr.map(parseQ).filter(x => x && !have.has(x.q) && have.add(x.q));
+      offs[tag] = arr.length && fresh.length ? off + arr.length : -1; // nothing new means this tag is used up
+      got.push(...fresh);
+    }
   }
-  const seen = new Set(), q = all.filter(x => !seen.has(x.q) && seen.add(x.q));
-  if (!q.length) throw new Error(`QuizAPI has no usable ${lang} questions`);
-  quizMem[lang] = q; try { localStorage.setItem('cca.q2.' + lang, JSON.stringify({ t: Date.now(), q })); } catch {}
-  return q;
+  try { localStorage.setItem('cca.off3.' + lang, JSON.stringify(offs)); } catch {}
+  return got;
 }
-
+async function getQuiz(lang, more = false) {
+  if (!quizMem[lang]) { try { quizMem[lang] = JSON.parse(localStorage.getItem('cca.q3.' + lang)) || []; } catch { quizMem[lang] = []; } if (!Array.isArray(quizMem[lang])) quizMem[lang] = []; }
+  if (!quizMem[lang].length || more) {
+    const got = await pull(lang); quizMem[lang] = [...quizMem[lang], ...got];
+    try { localStorage.setItem('cca.q3.' + lang, JSON.stringify(quizMem[lang])); } catch {}
+  }
+  if (!quizMem[lang].length) throw new Error(`QuizAPI has no usable ${lang} questions`);
+  return quizMem[lang];
+}
 // ---------- storage ----------
 const newUser = () => ({ elo: Object.fromEntries(LANGS.map(l => [l, 1000])), stats: Object.fromEntries(LANGS.map(l => [l, { done: 0, ok: 0, ms: 0 }])),
   history: [], sessions: [], seen: [], days: [], theme: 'dark', lang: 'Python', anim: true });
@@ -88,6 +97,18 @@ const unlocked = u => ACH.filter(a => a[2](u)).map(a => a[0]);
 function toast(msg) { const t = document.createElement('div'); t.textContent = msg; $('#toast').append(t); setTimeout(() => t.remove(), 4000); }
 function applyPrefs() { const u = me(); document.documentElement.dataset.theme = u.theme; document.body.classList.toggle('noanim', !u.anim); }
 
+// ---------- Supabase (optional): global leaderboard through the REST API, no extra library ----------
+const SB = window.CCA_CONFIG?.supabaseUrl && window.CCA_CONFIG?.supabaseAnonKey ? { url: window.CCA_CONFIG.supabaseUrl.replace(/\/$/, ''), key: window.CCA_CONFIG.supabaseAnonKey } : null;
+const sbFetch = (path, opt = {}) => fetch(`${SB.url}/rest/v1/${path}`, { ...opt, headers: { apikey: SB.key, Authorization: 'Bearer ' + SB.key, 'Content-Type': 'application/json', ...opt.headers } });
+async function syncPlayer() {
+  if (!SB) return; const u = me();
+  try {
+    const r = await sbFetch('players?on_conflict=username', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
+      body: JSON.stringify({ username: db.current, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) { toast('Could not sync to Supabase: ' + e.message); }
+}
+
 // ---------- shell ----------
 const VIEWS = { dashboard: 'Dashboard', arena: 'Play Arena', practice: 'Practice', leaderboard: 'Leaderboard', stats: 'Statistics', profile: 'Profile', settings: 'Settings' };
 $('#nav').innerHTML = Object.entries(VIEWS).map(([k, v]) => `<button data-view="${k}"><span>${v}</span></button>`).join('');
@@ -102,8 +123,9 @@ function go(v) {
 function setMe() { const r = overall(me()); $('#me').innerHTML = `<b>${esc(db.current)}</b>${r} Elo · ${RANKS[rankIdx(r)][0]}`; }
 const view = html => { $('#view').innerHTML = html; };
 const skeleton = () => view('<h1>Loading problems</h1><p class="mute">Fetching questions…</p><div class="grid"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>');
-const failure = (e, again) => { view(`<div class="empty"><h2>Could not load problems</h2><p>${esc(e.message)}. Check your connection, then retry.</p><br><button class="primary" id="retry">Retry</button></div>`);
+const failure = (e, again) => { view(`<div class="empty"><h2>Could not load questions</h2><p>${esc(e.message)}.</p><br><button class="primary" id="retry">Retry</button></div>`);
   $('#retry').onclick = again; };
+const notice = (t, m, back) => { view(`<div class="empty"><h2>${t}</h2><p>${esc(m)}</p><br><button class="primary" id="bk">Back</button></div>`); $('#bk').onclick = () => go(back); };
 const stat = (l, v, sub = '') => `<div class="card"><div class="mute">${l}</div><div class="big">${v}</div>${sub}</div>`;
 const bar = p => `<div class="bar"><i style="width:${Math.round(p * 100)}%"></i></div>`;
 function prog(r) { const i = rankIdx(r), n = RANKS[i + 1]; return n ? (r - RANKS[i][1]) / (n[1] - RANKS[i][1]) : 1; }
@@ -125,7 +147,7 @@ const views = {
     eloChart($('#ch'));
   },
   arena() {
-    const u = me(), c = { mode: 'rapid', lang: u.lang, diff: 'medium', n: 5 };
+    const u = me(), c = { mode: 'rapid', lang: u.lang, diff: 'medium', n: 5, tag: '' };
     const sync = () => { if (!$('#l')) return; c.lang = $('#l').value; c.tag = $('#t').value; c.diff = $('#d').value; c.n = +$('#n').value; };
     const draw = (msg = '') => view(`<h1>Play Arena</h1><p class="mute">Multiple-choice questions for the language you pick, from QuizAPI. You answer right here.</p>
       <div class="modes">${Object.entries(MODES).map(([k, m]) => `<button class="card mode ${c.mode === k ? 'on' : ''}" data-m="${k}"><b>${m[0]}</b>${m[1] ? m[1] + ' s per question' : 'No time limit'}<br><span class="mute">${m[2]}</span></button>`).join('')}</div>
@@ -148,10 +170,23 @@ const views = {
     $('#start').onclick = () => { const n = +$('#n').value; if (!(n >= 1 && n <= 20)) return ($('#err').textContent = 'Choose between 1 and 20 questions.');
       begin({ mode: 'classic', practice: true, lang: $('#l').value, tag: $('#t').value, diff: $('#d').value, n }, 'practice'); };
   },
-  leaderboard() {
-    const rows = Object.entries(db.users).map(([n, u]) => ({ n, r: overall(u), u })).sort((a, b) => b.r - a.r);
-    view(`<h1>Local leaderboard</h1><p class="mute">Players on this browser only. A shared online board needs a backend (not included in this version).</p>
-      <div class="podium">${rows.slice(0, 3).map((x, i) => `<div class="card p${i + 1}"><div class="mute">#${i + 1}</div><b>${esc(x.n)}</b><div class="big">${x.r}</div></div>`).join('')}</div><div class="card">${rows.map((x, i) => `<div class="row"><span>#${i + 1} ${esc(x.n)}</span><span>${x.r} Elo · ${total(x.u, 'done') ? acc(x.u) : 0}% win rate</span></div>`).join('')}</div>`);
+  async leaderboard() {
+    let rows = Object.entries(db.users).map(([n, u]) => ({ n, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok') })), global = false;
+    if (SB) {
+      view('<h1>Leaderboard</h1><div class="sk"></div>');
+      try { const r = await sbFetch('players?select=username,overall,elos,done,ok&order=overall.desc&limit=50'); if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json(); if (Array.isArray(j)) { rows = j.map(x => ({ n: x.username, overall: x.overall, elos: x.elos || {}, done: x.done || 0, ok: x.ok || 0 })); global = true; } }
+      catch (e) { toast('Supabase unavailable, showing local players: ' + e.message); }
+    }
+    const draw = (lang = '') => {
+      const val = x => (lang ? x.elos[lang] ?? 1000 : x.overall), sorted = [...rows].sort((a, b) => val(b) - val(a)), wr = x => (x.done ? Math.round(100 * x.ok / x.done) : 0);
+      view(`<h1>${global ? 'Global' : 'Local'} leaderboard</h1><p class="mute">${global ? 'Everyone who plays this app (stored in Supabase).' : 'Players on this browser only. Add your Supabase keys in config.js for a global board.'}</p>
+        <div class="form"><label>Language<select id="lf"><option value="">Overall</option>${LANGS.map(l => `<option ${l === lang ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+        ${sorted.length ? `<div class="podium">${sorted.slice(0, 3).map((x, i) => `<div class="card p${i + 1}"><div class="mute">#${i + 1}</div><b>${esc(x.n)}</b><div class="big">${val(x)}</div></div>`).join('')}</div>
+        <div class="card">${sorted.map((x, i) => `<div class="row"><span>#${i + 1} ${esc(x.n)}</span><span>${val(x)} Elo · ${wr(x)}% win rate</span></div>`).join('')}</div>` : '<div class="empty">No players yet.</div>'}`);
+      $('#lf').onchange = e => draw(e.target.value);
+    };
+    draw();
   },
   stats() {
     const u = me(), t = total(u, 'done');
@@ -184,17 +219,19 @@ const views = {
     $('#an').onchange = e => { u.anim = e.target.value === '1'; save(); applyPrefs(); };
     $('#pl')?.addEventListener('change', e => { db.current = e.target.value; save(); go('settings'); });
     $('#rs').onclick = () => { if (confirm('Reset Elo, stats and history for this player?')) { db.users[db.current] = newUser(); save(); toast('Progress reset'); go('settings'); } };
-    $('#cl').onclick = () => { if (confirm('Delete ALL saved data, including the cached problem list?')) { localStorage.removeItem(KEY); Object.keys(localStorage).filter(k => k.startsWith('cca.')).forEach(k => localStorage.removeItem(k)); db = load(); go('dashboard'); } };
+    $('#cl').onclick = () => { if (confirm('Delete ALL saved data, including the cached problem list?')) { Object.keys(localStorage).filter(k => k.startsWith('cca.')).forEach(k => localStorage.removeItem(k)); db = load(); go('dashboard'); } };
   },
 };
 
-// ---------- game session ----------
+
 async function fillTopics() {
-  const t = $('#t'), l = $('#l'); if (!t || !l) return; const lang = l.value; t.innerHTML = '<option value="">Loading topics…</option>';
+  const t = $('#t'), l = $('#l'); if (!t || !l) return; const lang = l.value, keep = t.value; t.innerHTML = '<option value="">Loading topics…</option>';
   let html = '<option value="">Any topic</option>';
-  try { const cnt = {}, skip = new Set(TAGS[lang]); (await getQuiz(lang)).forEach(q => q.tags.forEach(g => { if (!skip.has(g)) cnt[g] = (cnt[g] || 0) + 1; }));
-    html += Object.keys(cnt).sort().map(g => `<option value="${esc(g)}">${esc(g)} (${cnt[g]})</option>`).join(''); } catch {}
-  if ($('#l')?.value === lang) t.innerHTML = html;
+  try {
+    const cnt = {}, skip = new Set([...TAGS[lang], lang.toLowerCase()]); (await getQuiz(lang)).forEach(q => q.tags.forEach(g => { if (!skip.has(g)) cnt[g] = 1; }));
+    const names = Object.keys(cnt).sort(); html += names.length ? names.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('') : '<option value="" disabled>(QuizAPI has no topics for this language)</option>';
+  } catch (e) { html += `<option value="" disabled>${e.message === 'NOKEY' ? '(API key not found: add it in Settings, or put config.js next to index.html)' : '(topics unavailable: ' + esc(e.message) + ')'}</option>`; }
+  if ($('#l')?.value === lang) { t.innerHTML = html; if ([...t.options].some(o => o.value === keep)) t.value = keep; }
 }
 function keyForm(retry) {
   view(`<div class="q card"><h1>QuizAPI key needed</h1><p class="mute">Language-specific questions (Java, Python, SQL…) come from QuizAPI. Create a free account at quizapi.io, copy your API key, and paste it here. It is saved only in this browser.</p>
@@ -203,11 +240,19 @@ function keyForm(retry) {
 }
 async function begin(c, back = 'arena') {
   const u = me(); skeleton(); let qs;
-  try { qs = await getQuiz(c.lang); } catch (e) { return e.message === 'NOKEY' ? keyForm(() => begin(c, back)) : failure(e, () => begin(c, back)); }
-  qs = qs.map(x => ({ ...x, id: hash(x.q) })); if (c.tag) qs = qs.filter(x => x.tags.includes(c.tag)); if (!c.practice) qs = qs.filter(x => !u.seen.includes(x.id));
-  const first = shuffle(qs.filter(x => x.diff === c.diff)), items = [...first, ...shuffle(qs.filter(x => x.diff !== c.diff))].slice(0, c.n);
-  if (!items.length) return failure(new Error('No unseen questions match these filters. Try another topic, difficulty or language'), () => go(back));
-  const note = first.length >= items.length ? '' : `Only ${Math.min(first.length, items.length)} ${c.diff} ${c.lang} question(s) are available; the rest are other difficulties.`;
+  const filt = l => (c.tag ? l.filter(x => x.tags.includes(c.tag)) : l), isNew = x => !u.seen.includes(hash(x.q));
+  try {
+    qs = await getQuiz(c.lang);
+    for (let i = 0; i < 5 && !c.practice && filt(qs).filter(isNew).length < c.n; i++) { const n = qs.length; qs = await getQuiz(c.lang, true); if (qs.length === n) break; } // page for more new questions
+  } catch (e) { return e.message === 'NOKEY' ? keyForm(() => begin(c, back)) : failure(e, () => begin(c, back)); }
+  const all = filt(qs).map(x => ({ ...x, id: hash(x.q) }));
+  if (!all.length) return notice('No questions for this topic', `QuizAPI has no ${c.lang} questions${c.tag ? ' tagged "' + c.tag + '"' : ''}. Try another topic or language.`, back);
+  let pool = c.practice ? all : all.filter(isNew), repeat = '';
+  if (!c.practice && pool.length < c.n) { const old = shuffle(all.filter(x => !isNew(x))).slice(0, c.n - pool.length); if (old.length) repeat = `You have answered nearly all available ${c.lang} questions, so ${old.length} are repeats.`; pool = [...pool, ...old]; }
+  const first = shuffle(pool.filter(x => x.diff === c.diff)), items = [...first, ...shuffle(pool.filter(x => x.diff !== c.diff))].slice(0, c.n);
+  const short = items.length < c.n ? `QuizAPI only has ${items.length} ${c.lang}${c.tag ? ' "' + c.tag + '"' : ''} question(s), so this session has ${items.length} instead of ${c.n}.` : '';
+  const dn = first.length >= items.length ? '' : first.length ? `Only ${first.length} ${c.diff} question(s) are available; the rest are other difficulties.` : `No ${c.diff} questions are available; using other difficulties.`;
+  const note = [short, dn, repeat].filter(Boolean).join(' ');
   S = { ...c, items, i: 0, res: [], note, before: overall(u), startRank: rankIdx(overall(u)), startLang: u.elo[c.lang] }; ask();
 }
 function ask() {
@@ -239,7 +284,7 @@ function finish() {
   S.res.forEach(r => { e = nextElo(e, DIFF_R[r.diff], r.res === 'ok' ? 1 : 0); const s = u.stats[S.lang]; s.done++; s.ms += r.ms; if (r.res === 'ok') s.ok++; u.seen.push(r.id); });
   u.seen = u.seen.slice(-300); u.elo[S.lang] = e; if (!u.days.includes(day())) u.days.push(day());
   const after = overall(u), ok = S.res.filter(r => r.res === 'ok').length, bad = S.res.filter(r => r.res === 'no').length, none = S.res.length - ok - bad;
-  u.sessions.push({ d: day(), lang: S.lang, mode: S.mode, ok, items: S.res.map(r => ({ id: r.id, res: r.res })), before: S.before, after }); u.history.push({ d: day(), e: after }); save();
+  u.sessions.push({ d: day(), lang: S.lang, mode: S.mode, ok, items: S.res.map(r => ({ id: r.id, res: r.res })), before: S.before, after }); u.history.push({ d: day(), e: after }); save(); syncPlayer();
   const up = rankIdx(after) > S.startRank, sum = { before: S.before, sl: S.startLang, n: S.res.length, res: S.res }; S = null; setMe();
   view(`<div class="q">${up ? `<div class="rankup"><h1>Rank up: ${RANKS[rankIdx(after)][0]}</h1></div>` : ''}<h1>Session results</h1>
     <div class="grid">${stat('Correct', `${ok} / ${sum.n}`)}${stat('Incorrect', bad)}${stat('Unanswered', none)}${stat('Language Elo', e, `<span class="${e >= sum.sl ? 'ok' : 'bad'}">${e - sum.sl >= 0 ? '+' : ''}${e - sum.sl}</span>`)}</div>
