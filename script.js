@@ -97,16 +97,66 @@ const unlocked = u => ACH.filter(a => a[2](u)).map(a => a[0]);
 function toast(msg) { const t = document.createElement('div'); t.textContent = msg; $('#toast').append(t); setTimeout(() => t.remove(), 4000); }
 function applyPrefs() { const u = me(); document.documentElement.dataset.theme = u.theme; document.body.classList.toggle('noanim', !u.anim); }
 
-// ---------- Supabase (optional): global leaderboard through the REST API, no extra library ----------
+// ---------- Supabase (optional): accounts (Auth) + global leaderboard through REST, no extra library ----------
 const SB = window.CCA_CONFIG?.supabaseUrl && window.CCA_CONFIG?.supabaseAnonKey ? { url: window.CCA_CONFIG.supabaseUrl.replace(/\/$/, ''), key: window.CCA_CONFIG.supabaseAnonKey } : null;
-const sbFetch = (path, opt = {}) => fetch(`${SB.url}/rest/v1/${path}`, { ...opt, headers: { apikey: SB.key, Authorization: 'Bearer ' + SB.key, 'Content-Type': 'application/json', ...opt.headers } });
+let auth = null; try { auth = JSON.parse(localStorage.getItem('cca.auth')); } catch {}
+const saveAuth = a => { auth = a; a ? localStorage.setItem('cca.auth', JSON.stringify(a)) : localStorage.removeItem('cca.auth'); };
+async function authCall(path, body) {
+  const r = await fetch(`${SB.url}/auth/v1/${path}`, { method: 'POST', headers: { apikey: SB.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.msg || j.error_description || j.message || 'HTTP ' + r.status); return j;
+}
+const sessionFrom = j => ({ token: j.access_token, refresh: j.refresh_token, uid: j.user.id, email: j.user.email, exp: Date.now() + (j.expires_in || 3600) * 1000 - 60000 });
+async function freshToken() {
+  if (!auth) return null;
+  if (Date.now() > auth.exp) { try { saveAuth(sessionFrom(await authCall('token?grant_type=refresh_token', { refresh_token: auth.refresh }))); } catch { saveAuth(null); return null; } }
+  return auth.token;
+}
+async function sbFetch(path, opt = {}) {
+  const t = await freshToken(), bearer = t || (SB.key.startsWith('eyJ') ? SB.key : '');
+  return fetch(`${SB.url}/rest/v1/${path}`, { ...opt, headers: { apikey: SB.key, ...(bearer ? { Authorization: 'Bearer ' + bearer } : {}), 'Content-Type': 'application/json', ...opt.headers } });
+}
 async function syncPlayer() {
-  if (!SB) return; const u = me();
+  if (!SB || !auth) return; const u = me();
   try {
-    const r = await sbFetch('players?on_conflict=username', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
-      body: JSON.stringify({ username: db.current, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) });
+    const r = await sbFetch('players?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
+      body: JSON.stringify({ id: auth.uid, nickname: db.current, avatar: u.avatar || null, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
   } catch (e) { toast('Could not sync to Supabase: ' + e.message); }
+}
+const RCOL = ['#94A3B8', '#34D399', '#22D3EE', '#3B82F6', '#8B5CF6', '#FBBF24'];
+const av = (src, name, cls = '') => src ? `<img class="av ${cls}" src="${esc(src)}" alt="">` : `<span class="av ${cls}">${esc((name || '?')[0].toUpperCase())}</span>`;
+const rb = i => `<span class="rb" style="--c:${RCOL[i]}">${RANKS[i][0][0]}</span>`;
+async function afterLogin(nickHint) {
+  let row = null;
+  try { const r = await sbFetch(`players?id=eq.${auth.uid}&select=*`); const j = r.ok ? await r.json() : []; row = j[0] || null; } catch {}
+  const nick = row?.nickname || nickHint || auth.email.split('@')[0].slice(0, 16);
+  if (!db.users[nick]) db.users[nick] = newUser(); db.current = nick; const u = me();
+  if (row?.elos && total(u, 'done') === 0) Object.assign(u.elo, row.elos);
+  if (row?.avatar) u.avatar = row.avatar; save(); if (!row) await syncPlayer(); go('dashboard');
+}
+function authScreen() {
+  document.body.classList.add('authing'); let mode = 'login';
+  const draw = (msg = '') => {
+    view(`<div class="q card"><h1>${mode === 'login' ? 'Log in' : 'Create account'}</h1><p class="mute">Your rating and profile are saved to your account.</p>
+      <div class="form" style="flex-direction:column;align-items:stretch">${mode === 'signup' ? '<label>First name or nickname<input id="au_n" maxlength="16" autocomplete="nickname"></label>' : ''}
+      <label>Email<input id="au_e" type="email" autocomplete="email"></label><label>Password (6+ characters)<input id="au_p" type="password" autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}"></label>
+      <button class="primary" id="au_go">${mode === 'login' ? 'Log in' : 'Create account'}</button></div><p class="${msg.startsWith('OK') ? 'ok' : 'bad'}" id="au_m">${esc(msg.replace(/^OK/, ''))}</p>
+      <div class="acts"><button class="ghost" id="au_sw">${mode === 'login' ? 'New here? Create an account' : 'Have an account? Log in'}</button><button class="ghost" id="au_g">Play as guest (this browser only)</button></div></div>`);
+    $('#au_sw').onclick = () => { mode = mode === 'login' ? 'signup' : 'login'; draw(); };
+    $('#au_g').onclick = () => { localStorage.setItem('cca.guest', '1'); document.body.classList.remove('authing'); go('dashboard'); };
+    $('#au_go').onclick = async () => {
+      const email = $('#au_e').value.trim(), pw = $('#au_p').value, nick = $('#au_n')?.value.trim() || '';
+      if (!/^\S+@\S+\.\S+$/.test(email)) return draw('Enter a valid email.'); if (pw.length < 6) return draw('Password needs 6 or more characters.');
+      if (mode === 'signup' && !/^[\w .-]{2,16}$/.test(nick)) return draw('Name: 2–16 letters, numbers, spaces, . _ -');
+      $('#au_go').disabled = true;
+      try {
+        const j = await authCall(mode === 'login' ? 'token?grant_type=password' : 'signup', mode === 'login' ? { email, password: pw } : { email, password: pw, data: { nickname: nick } });
+        if (!j.access_token) return draw('OKAccount created. Check your email to confirm it, then log in.');
+        saveAuth(sessionFrom(j)); await afterLogin(nick || j.user?.user_metadata?.nickname);
+      } catch (e) { draw(e.message); }
+    };
+  };
+  draw();
 }
 
 // ---------- shell ----------
@@ -116,11 +166,11 @@ $('#nav').onclick = e => { const b = e.target.closest('[data-view]'); if (b) go(
 $('#collapse').onclick = () => document.body.classList.toggle('slim');
 let timer = null, S = null, charts = [];
 function go(v) {
-  clearInterval(timer); S = null; $('#view').onclick = null; charts.forEach(c => c.destroy()); charts = [];
+  clearInterval(timer); S = null; $('#view').onclick = null; document.body.classList.remove('authing'); charts.forEach(c => c.destroy()); charts = [];
   document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.view === v));
   setMe(); applyPrefs(); location.hash = v; views[v]();
 }
-function setMe() { const r = overall(me()); $('#me').innerHTML = `<b>${esc(db.current)}</b>${r} Elo · ${RANKS[rankIdx(r)][0]}`; }
+function setMe() { const r = overall(me()); $('#me').innerHTML = `${av(me().avatar, db.current)}<b>${esc(db.current)}</b>${r} Elo · ${RANKS[rankIdx(r)][0]}`; }
 const view = html => { $('#view').innerHTML = html; };
 const skeleton = () => view('<h1>Loading problems</h1><p class="mute">Fetching questions…</p><div class="grid"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>');
 const failure = (e, again) => { view(`<div class="empty"><h2>Could not load questions</h2><p>${esc(e.message)}.</p><br><button class="primary" id="retry">Retry</button></div>`);
@@ -171,19 +221,19 @@ const views = {
       begin({ mode: 'classic', practice: true, lang: $('#l').value, tag: $('#t').value, diff: $('#d').value, n }, 'practice'); };
   },
   async leaderboard() {
-    let rows = Object.entries(db.users).map(([n, u]) => ({ n, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok') })), global = false;
+    let rows = Object.entries(db.users).map(([n, u]) => ({ n, avatar: u.avatar, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok') })), global = false;
     if (SB) {
       view('<h1>Leaderboard</h1><div class="sk"></div>');
-      try { const r = await sbFetch('players?select=username,overall,elos,done,ok&order=overall.desc&limit=50'); if (!r.ok) throw new Error('HTTP ' + r.status);
-        const j = await r.json(); if (Array.isArray(j)) { rows = j.map(x => ({ n: x.username, overall: x.overall, elos: x.elos || {}, done: x.done || 0, ok: x.ok || 0 })); global = true; } }
+      try { const r = await sbFetch('players?select=nickname,avatar,overall,elos,done,ok&order=overall.desc&limit=50'); if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json(); if (Array.isArray(j)) { rows = j.map(x => ({ n: x.nickname, avatar: x.avatar, overall: x.overall, elos: x.elos || {}, done: x.done || 0, ok: x.ok || 0 })); global = true; } }
       catch (e) { toast('Supabase unavailable, showing local players: ' + e.message); }
     }
     const draw = (lang = '') => {
       const val = x => (lang ? x.elos[lang] ?? 1000 : x.overall), sorted = [...rows].sort((a, b) => val(b) - val(a)), wr = x => (x.done ? Math.round(100 * x.ok / x.done) : 0);
       view(`<h1>${global ? 'Global' : 'Local'} leaderboard</h1><p class="mute">${global ? 'Everyone who plays this app (stored in Supabase).' : 'Players on this browser only. Add your Supabase keys in config.js for a global board.'}</p>
         <div class="form"><label>Language<select id="lf"><option value="">Overall</option>${LANGS.map(l => `<option ${l === lang ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
-        ${sorted.length ? `<div class="podium">${sorted.slice(0, 3).map((x, i) => `<div class="card p${i + 1}"><div class="mute">#${i + 1}</div><b>${esc(x.n)}</b><div class="big">${val(x)}</div></div>`).join('')}</div>
-        <div class="card">${sorted.map((x, i) => `<div class="row"><span>#${i + 1} ${esc(x.n)}</span><span>${val(x)} Elo · ${wr(x)}% win rate</span></div>`).join('')}</div>` : '<div class="empty">No players yet.</div>'}`);
+        ${sorted.length ? `<div class="podium">${sorted.slice(0, 3).map((x, i) => `<div class="card p${i + 1}"><div class="mute">#${i + 1}</div>${av(x.avatar, x.n)}<br><b>${esc(x.n)}</b><div class="big">${val(x)}</div></div>`).join('')}</div>
+        <div class="card">${sorted.map((x, i) => `<div class="row"><span>#${i + 1} ${av(x.avatar, x.n)} ${esc(x.n)}</span><span>${val(x)} Elo · ${wr(x)}% win rate</span></div>`).join('')}</div>` : '<div class="empty">No players yet.</div>'}`);
       $('#lf').onchange = e => draw(e.target.value);
     };
     draw();
@@ -196,16 +246,26 @@ const views = {
     eloChart($('#ch'));
   },
   profile() {
-    const u = me(), r = overall(u), got = unlocked(u);
-    view(`<h1>${esc(db.current)}</h1><p class="mute">${RANKS[rankIdx(r)][0]} · ${RANKS[rankIdx(r)][2]}</p>${bar(prog(r))}
-      <div class="form"><label>Username<input id="nm" maxlength="16" value="${esc(db.current)}"></label><button id="ren">Save name</button><button id="new">Add player</button></div>
-      <div class="grid">${stat('Elo', r)}${stat('Sessions', u.sessions.length)}${stat('Best session', u.sessions.length ? Math.max(...u.sessions.map(s => Math.round(100 * s.ok / s.items.length))) + '%' : '—')}</div>
+    const u = me(), r = overall(u), ri = rankIdx(r), got = unlocked(u);
+    view(`<div class="row" style="justify-content:flex-start;gap:1.25rem;border:0">${av(u.avatar, db.current, 'big')}<div style="flex:1"><h1>${esc(db.current)}</h1><p class="mute">${auth ? esc(auth.email) : 'Guest (saved on this browser only)'} · ${RANKS[ri][0]} · ${r} Elo</p>${bar(prog(r))}</div></div>
+      <div class="form"><label>Nickname<input id="nm" maxlength="16" value="${esc(db.current)}"></label><button id="ren">Save nickname</button><label>Profile photo<input id="ph" type="file" accept="image/*"></label>
+      ${auth ? '<button id="out">Log out</button>' : SB ? '<button id="in">Log in / create account</button>' : ''}<button id="new">Add local player</button></div>
+      <h2>Rank badges</h2><div class="grid">${RANKS.map((x, i) => `<div class="card ${i <= ri ? '' : 'lock'}">${rb(i)} <b>${x[0]}</b><p class="mute">${x[1]}+ Elo</p></div>`).join('')}</div>
       <h2>Achievements</h2><div class="grid">${ACH.map(a => `<div class="card ${got.includes(a[0]) ? '' : 'lock'}"><b>${a[0]}</b><p class="mute">${a[1]}</p>${got.includes(a[0]) ? '<span class="ok">Unlocked</span>' : 'Locked'}</div>`).join('')}</div>
+      <h2>Stats</h2><div class="grid">${stat('Sessions', u.sessions.length)}${stat('Questions', total(u, 'done'))}${stat('Accuracy', acc(u) + '%')}${stat('Best session', u.sessions.length ? Math.max(...u.sessions.map(s => Math.round(100 * s.ok / s.items.length))) + '%' : '—')}</div>
       <h2>Session history</h2><div class="card">${u.sessions.length ? u.sessions.slice().reverse().map(s => `<div class="row"><span>${s.d} · ${s.lang}</span><span>${s.ok}/${s.items.length} · ${s.before} → ${s.after}</span></div>`).join('') : '<p class="mute">No sessions yet.</p>'}</div>`);
     const ok = n => /^[\w .-]{2,16}$/.test(n) && !db.users[n];
-    $('#ren').onclick = () => { const n = $('#nm').value.trim(); if (n === db.current) return; if (!ok(n)) return toast('Use 2–16 letters, numbers, spaces, . _ - (name must be unused).');
+    $('#ren').onclick = async () => { const n = $('#nm').value.trim(); if (n === db.current) return; if (!ok(n)) return toast('Use 2–16 letters, numbers, spaces, . _ - (name must be unused).');
+      if (SB && auth) { try { const r = await sbFetch(`players?id=eq.${auth.uid}`, { method: 'PATCH', body: JSON.stringify({ nickname: n }) }); if (r.status === 409) return toast('That nickname is taken.'); if (!r.ok) throw new Error('HTTP ' + r.status); } catch (e) { return toast('Could not save nickname: ' + e.message); } }
       db.users[n] = db.users[db.current]; delete db.users[db.current]; db.current = n; save(); go('profile'); };
     $('#new').onclick = () => { const n = prompt('New player name'); if (n === null) return; if (!ok(n.trim())) return toast('Invalid or already used name.'); db.users[n.trim()] = newUser(); db.current = n.trim(); save(); go('profile'); };
+    $('#out')?.addEventListener('click', () => { saveAuth(null); localStorage.removeItem('cca.guest'); location.reload(); });
+    $('#in')?.addEventListener('click', () => { localStorage.removeItem('cca.guest'); location.reload(); });
+    $('#ph').onchange = e => { const f = e.target.files[0]; if (!f || !f.type.startsWith('image/') || f.size > 5e6) return toast('Choose an image under 5 MB.');
+      const img = new Image(), url = URL.createObjectURL(f);
+      img.onload = () => { const c = document.createElement('canvas'); c.width = c.height = 128; const m = Math.min(img.width, img.height);
+        c.getContext('2d').drawImage(img, (img.width - m) / 2, (img.height - m) / 2, m, m, 0, 0, 128, 128); URL.revokeObjectURL(url); u.avatar = c.toDataURL('image/jpeg', .8); save(); syncPlayer(); go('profile'); };
+      img.onerror = () => toast('Could not read that image.'); img.src = url; };
   },
   settings() {
     const u = me(), others = Object.keys(db.users);
@@ -219,7 +279,7 @@ const views = {
     $('#an').onchange = e => { u.anim = e.target.value === '1'; save(); applyPrefs(); };
     $('#pl')?.addEventListener('change', e => { db.current = e.target.value; save(); go('settings'); });
     $('#rs').onclick = () => { if (confirm('Reset Elo, stats and history for this player?')) { db.users[db.current] = newUser(); save(); toast('Progress reset'); go('settings'); } };
-    $('#cl').onclick = () => { if (confirm('Delete ALL saved data, including the cached problem list?')) { Object.keys(localStorage).filter(k => k.startsWith('cca.')).forEach(k => localStorage.removeItem(k)); db = load(); go('dashboard'); } };
+    $('#cl').onclick = () => { if (confirm('Delete ALL saved data, including the cached problem list?')) { Object.keys(localStorage).filter(k => k.startsWith('cca.')).forEach(k => localStorage.removeItem(k)); location.reload(); } };
   },
 };
 
@@ -294,4 +354,6 @@ function finish() {
   ACH.filter(a => a[2](u) && !had.includes(a[0])).forEach(a => toast('Achievement unlocked: ' + a[0]));
 }
 document.addEventListener('click', e => { if (e.target.closest('[data-daily]')) return begin({ mode: 'classic', lang: me().lang, diff: 'medium', n: 1 }); const g = e.target.closest('[data-go]'); if (g) go(g.dataset.go); });
-go(Object.keys(VIEWS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'dashboard');
+if (SB && !auth && !localStorage.getItem('cca.guest')) authScreen();
+else go(Object.keys(VIEWS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'dashboard');
+if (auth) freshToken().then(t => { if (!t) location.reload(); });

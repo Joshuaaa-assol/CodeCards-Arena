@@ -48,3 +48,6 @@ body.noanim *{animation:none!important;transition:none!important}
 
 .opt{text-align:left;width:100%}.opt.sel{border-color:var(--cyan)}.opt.right{border-color:var(--ok);background:rgba(52,211,153,.12)}.opt.wrong{border-color:var(--bad);background:rgba(248,113,113,.12)}
 .logo{display:block}.logoimg{width:100%;display:block;border-radius:10px}.logo .mark{display:none;text-align:center}body.slim .logoimg{display:none}body.slim .logo .mark{display:block}
+.av{width:36px;height:36px;border-radius:50%;object-fit:cover;display:inline-flex;align-items:center;justify-content:center;background:var(--bg2);border:1px solid var(--line);font-weight:700;flex:none;vertical-align:middle}.av.big{width:84px;height:84px;font-size:2rem}.me .av{margin-bottom:.4rem}body.slim .me{display:block}body.slim .me b,body.slim .me{font-size:0}body.slim .me .av{font-size:1rem}
+.rb{display:inline-flex;width:30px;height:30px;border-radius:8px;background:var(--c);color:#06101f;font-weight:700;align-items:center;justify-content:center;vertical-align:middle}
+body.authing #side{display:none}body.authing main{display:flex;align-items:center}
