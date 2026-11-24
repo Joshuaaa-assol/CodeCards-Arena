@@ -36,16 +36,17 @@ function parseQ(x) { // accepts QuizAPI's legacy and current shapes; single-corr
 }
 const quizMem = {}, quizOff = {}; // question pool per language, and how far we've paged through each tag
 async function pull(lang) { // fetch up to 5 more pages per tag; returns only questions we don't have yet
-  const key = apiKey(); if (!key) throw new Error('NOKEY');
+  const key = apiKey(), proxy = !key && SB; if (!key && !SB) throw new Error('NOKEY'); // no local key: use the Supabase function that holds the key
+  const hdr = proxy ? { apikey: SB.key } : { Authorization: 'Bearer ' + key };
   const offs = quizOff[lang] ??= JSON.parse(localStorage.getItem('cca.off3.' + lang) || '{}'), have = new Set((quizMem[lang] || []).map(x => x.q)), got = [];
   for (const tag of TAGS[lang]) {
     for (let page = 0; page < 5 && offs[tag] !== -1; page++) {
-      const off = offs[tag] || 0, base = `https://quizapi.io/api/v1/questions?tags=${encodeURIComponent(tag)}&limit=50&offset=${off}`;
-      let r = await fetch(base, { headers: { Authorization: 'Bearer ' + key } }).catch(() => null);
-      if (!r || r.status === 401 || r.status === 403) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
-      if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: { Authorization: 'Bearer ' + key } }).catch(() => null);
+      const off = offs[tag] || 0, base = `${proxy ? SB.url + '/functions/v1/quiz' : 'https://quizapi.io/api/v1/questions'}?tags=${encodeURIComponent(tag)}&limit=50&offset=${off}`;
+      let r = await fetch(base, { headers: hdr }).catch(() => null);
+      if (!proxy && (!r || r.status === 401 || r.status === 403)) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
+      if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: hdr }).catch(() => null);
       if (!r) throw new Error('Could not reach QuizAPI (network or CORS problem)');
-      if (r.status === 401 || r.status === 403) throw new Error('QuizAPI rejected your API key. Check it in Settings');
+      if (r.status === 401 || r.status === 403) throw new Error(proxy ? 'The question function rejected the request (turn off Verify JWT for it in Supabase)' : 'QuizAPI rejected your API key. Check it in Settings');
       if (r.status === 429) throw new Error('QuizAPI rate limit reached. Try again later');
       if (r.status === 404) { offs[tag] = -1; break; }
       if (!r.ok) throw new Error('QuizAPI returned HTTP ' + r.status);
@@ -115,13 +116,12 @@ async function sbFetch(path, opt = {}) {
   const t = await freshToken(), bearer = t || (SB.key.startsWith('eyJ') ? SB.key : '');
   return fetch(`${SB.url}/rest/v1/${path}`, { ...opt, headers: { apikey: SB.key, ...(bearer ? { Authorization: 'Bearer ' + bearer } : {}), 'Content-Type': 'application/json', ...opt.headers } });
 }
+const pushPlayer = nick => { const u = me(); return sbFetch('players?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
+  body: JSON.stringify({ id: auth.uid, nickname: nick, avatar: u.avatar || null, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) }); };
 async function syncPlayer() {
-  if (!SB || !auth) return; const u = me();
-  try {
-    const r = await sbFetch('players?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
-      body: JSON.stringify({ id: auth.uid, nickname: db.current, avatar: u.avatar || null, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-  } catch (e) { toast('Could not sync to Supabase: ' + e.message); }
+  if (!SB || !auth) return;
+  try { const r = await pushPlayer(db.current); if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text().catch(() => '')).slice(0, 120)}`); }
+  catch (e) { toast('Could not save to Supabase: ' + e.message); }
 }
 const RCOL = ['#94A3B8', '#34D399', '#22D3EE', '#3B82F6', '#8B5CF6', '#FBBF24'];
 const av = (src, name, cls = '') => src ? `<img class="av ${cls}" src="${esc(src)}" alt="">` : `<span class="av ${cls}">${esc((name || '?')[0].toUpperCase())}</span>`;
@@ -256,7 +256,7 @@ const views = {
       <h2>Session history</h2><div class="card">${u.sessions.length ? u.sessions.slice().reverse().map(s => `<div class="row"><span>${s.d} · ${s.lang}</span><span>${s.ok}/${s.items.length} · ${s.before} → ${s.after}</span></div>`).join('') : '<p class="mute">No sessions yet.</p>'}</div>`);
     const ok = n => /^[\w .-]{2,16}$/.test(n) && !db.users[n];
     $('#ren').onclick = async () => { const n = $('#nm').value.trim(); if (n === db.current) return; if (!ok(n)) return toast('Use 2–16 letters, numbers, spaces, . _ - (name must be unused).');
-      if (SB && auth) { try { const r = await sbFetch(`players?id=eq.${auth.uid}`, { method: 'PATCH', body: JSON.stringify({ nickname: n }) }); if (r.status === 409) return toast('That nickname is taken.'); if (!r.ok) throw new Error('HTTP ' + r.status); } catch (e) { return toast('Could not save nickname: ' + e.message); } }
+      if (SB && auth) { try { const r = await pushPlayer(n); if (r.status === 409) return toast('That nickname is taken.'); if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text().catch(() => '')).slice(0, 120)}`); } catch (e) { return toast('Could not save nickname: ' + e.message); } }
       db.users[n] = db.users[db.current]; delete db.users[db.current]; db.current = n; save(); go('profile'); };
     $('#new').onclick = () => { const n = prompt('New player name'); if (n === null) return; if (!ok(n.trim())) return toast('Invalid or already used name.'); db.users[n.trim()] = newUser(); db.current = n.trim(); save(); go('profile'); };
     $('#out')?.addEventListener('click', () => { saveAuth(null); localStorage.removeItem('cca.guest'); location.reload(); });
