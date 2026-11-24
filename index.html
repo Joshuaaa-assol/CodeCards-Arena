@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Cards Arena</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="assets/favicon.png">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+<script type="module" src="script.js"></script>
+</head>
+<body>
+<aside id="side" aria-label="Main navigation">
+  <div class="logo"><img class="logoimg" src="assets/logo.png" alt="Code Cards Arena"><span class="mark">CC</span></div>
+  <nav id="nav"></nav>
+  <button id="collapse" class="ghost" aria-label="Collapse sidebar">Collapse</button>
+  <div class="me" id="me"></div>
+</aside>
+<main id="view" tabindex="-1"></main>
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
