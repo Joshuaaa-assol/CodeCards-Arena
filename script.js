@@ -1,4 +1,4 @@
-const LANGS = ['Java', 'Python', 'JavaScript', 'C++', 'C', 'HTML/CSS', 'SQL'];
+const LANGS = ['Java', 'Python', 'JavaScript', 'C++', 'C#', 'C', 'HTML/CSS', 'SQL'];
 const RANKS = [['Beginner', 0, 'Learning the basics.'], ['Novice', 1100, 'Solving easy problems reliably.'], ['Intermediate', 1300, 'Comfortable with common patterns.'],
   ['Advanced', 1500, 'Handles mixed difficulty.'], ['Expert', 1700, 'Strong across many topics.'], ['Master', 1900, 'Top of the arena.']];
 const MODES = { blitz: ['Blitz', 15, 'Fast and high pressure.'], rapid: ['Rapid', 30, 'Balanced pace.'], classic: ['Classic', 0, 'No time limit. Focus on accuracy.'] };
@@ -13,7 +13,7 @@ const DIFF_R = { easy: 900, medium: 1300, hard: 1700 }; // opponent rating used 
 const TTL = 6 * 36e5, KEYNAME = 'cca.key';
 const DEFAULT_KEY = window.CCA_CONFIG?.quizApiKey || ''; // comes from config.js (git-ignored); a key saved in Settings overrides it
 const apiKey = () => localStorage.getItem(KEYNAME) || DEFAULT_KEY;
-const TAGS = { Java: ['java'], Python: ['python'], JavaScript: ['javascript'], 'C++': ['c++', 'cpp'], C: ['c'], 'HTML/CSS': ['html', 'css'], SQL: ['sql', 'mysql'] };
+const TAGS = { Java: ['java'], Python: ['python'], JavaScript: ['javascript'], 'C++': ['c++', 'cpp', 'cplusplus'], 'C#': ['c#', 'csharp', 'c-sharp'], C: ['c', 'c-programming', 'clang'], 'HTML/CSS': ['html', 'css'], SQL: ['sql', 'mysql'] };
 const shuffle = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const dec = t => new DOMParser().parseFromString(t, 'text/html').body.textContent;
 const hash = t => { let h = 0; for (const ch of t) h = (h * 31 + ch.codePointAt(0)) | 0; return 'q' + (h >>> 0).toString(36); };
@@ -35,33 +35,45 @@ function parseQ(x) { // accepts QuizAPI's legacy and current shapes; single-corr
   return { q: text, correct: opts[ci], opts: shuffle(opts), diff: DIFF_R[d] ? d : 'medium', tags };
 }
 const quizMem = {}, quizOff = {}; // question pool per language, and how far we've paged through each tag
-async function pull(lang) { // fetch up to 5 more pages per tag; returns only questions we don't have yet
-  const key = apiKey(), proxy = !key && SB; if (!key && !SB) throw new Error('NOKEY'); // no local key: use the Supabase function that holds the key
+// Some languages have no tag in the question bank (C often has none). For those we read the Programming category and keep only questions that clearly mention the language.
+const KW = {
+  C: t => (/\b(printf|scanf|malloc|calloc|realloc|stdio|stdlib|#include|sizeof|typedef|fopen|strcpy|strlen|segmentation fault)\b/i.test(t) || /\bin C\b|\bC (language|programming|program|code|compiler|standard)\b/.test(t)) && !/C\+\+|C#|\bJava|Python|JavaScript/.test(t),
+  'C#': t => /\bC#|csharp|\.NET\b|\bLINQ\b|\bNuGet\b/i.test(t), 'C++': t => /c\+\+|\bstd::|\bcout\b|\bnullptr\b|\bconstexpr\b/i.test(t), Java: t => /\bjava\b(?!script)|\bJVM\b|System\.out|\bJDK\b/i.test(t),
+  Python: t => /python|\bPEP ?8\b|\bpip\b/i.test(t), JavaScript: t => /javascript|node\.?js|\bES6\b/i.test(t), 'HTML/CSS': t => /\bhtml\b|\bcss\b|flexbox/i.test(t), SQL: t => /\bsql\b|\bGROUP BY\b|\bJOIN\b/i.test(t) };
+const giveaway = q => { const m = Math.max(...q.opts.filter(o => o !== q.correct).map(o => o.length)); return q.correct.length > m && q.correct.length >= m * 1.4 && q.correct.length - m >= 12; }; // correct answer is obviously the longest
+async function page(qs, off) { // one request to the question source; returns the raw question list, or null when there is nothing (404)
+  const key = apiKey(), proxy = !key && SB; if (!key && !SB) throw new Error('NOKEY');
   const hdr = proxy ? { apikey: SB.key } : { Authorization: 'Bearer ' + key };
+  const base = `${proxy ? SB.url + '/functions/v1/quiz' : 'https://quizapi.io/api/v1/questions'}?${qs}&limit=50&offset=${off}`;
+  let r = await fetch(base, { headers: hdr }).catch(() => null);
+  if (!proxy && (!r || r.status === 401 || r.status === 403)) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
+  if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: hdr }).catch(() => null);
+  if (!r) throw new Error(proxy ? 'Could not reach the quiz function in Supabase. Deploy the Edge Function named "quiz" and turn off Verify JWT' : 'Could not reach the question service');
+  if (r.status === 401 || r.status === 403) throw new Error(proxy ? 'The question function rejected the request (turn off Verify JWT for it in Supabase)' : 'The question service rejected the request');
+  if (r.status === 429) throw new Error('Too many requests. Try again in a moment');
+  if (r.status === 404) { const t = await r.clone().text().catch(() => ''); if (proxy && /function/i.test(t) && /not found/i.test(t)) throw new Error('The quiz function is not deployed in Supabase yet'); return null; }
+  if (!r.ok) throw new Error('Question service returned HTTP ' + r.status);
+  const j = await r.json().catch(() => null), arr = Array.isArray(j) ? j : j?.data?.questions || j?.data || j?.questions || j?.results;
+  if (!Array.isArray(arr)) throw new Error('Unexpected response from the question service');
+  return arr;
+}
+async function pull(lang) { // fetch up to 5 more pages; returns only usable questions we don't have yet
   const offs = quizOff[lang] ??= JSON.parse(localStorage.getItem('cca.off3.' + lang) || '{}'), have = new Set((quizMem[lang] || []).map(x => x.q)), got = [];
-  for (const tag of TAGS[lang]) {
-    for (let page = 0; page < 5 && offs[tag] !== -1; page++) {
-      const off = offs[tag] || 0, base = `${proxy ? SB.url + '/functions/v1/quiz' : 'https://quizapi.io/api/v1/questions'}?tags=${encodeURIComponent(tag)}&limit=50&offset=${off}`;
-      let r = await fetch(base, { headers: hdr }).catch(() => null);
-      if (!proxy && (!r || r.status === 401 || r.status === 403)) r = await fetch(base + '&apiKey=' + encodeURIComponent(key)).catch(() => null);
-      if (r && r.status === 400 && off === 0) r = await fetch(base.replace('&offset=0', ''), { headers: hdr }).catch(() => null);
-      if (!r) throw new Error(proxy ? 'Could not reach the quiz function in Supabase. Deploy the Edge Function named "quiz" and turn off Verify JWT' : 'Could not reach the question service');
-      if (r.status === 401 || r.status === 403) throw new Error(proxy ? 'The question function rejected the request (turn off Verify JWT for it in Supabase)' : 'The question service rejected the request');
-      if (r.status === 429) throw new Error('Too many requests. Try again in a moment');
-      if (r.status === 404) { if (proxy && /not found/i.test(await r.clone().text().catch(() => '')) && /function/i.test(await r.clone().text().catch(() => ''))) throw new Error('The quiz function is not deployed in Supabase yet'); offs[tag] = -1; break; }
-      if (!r.ok) throw new Error('Question service returned HTTP ' + r.status);
-      const j = await r.json().catch(() => null), arr = Array.isArray(j) ? j : j?.data?.questions || j?.data || j?.questions || j?.results;
-      if (!Array.isArray(arr)) throw new Error('Unexpected response from the question service');
-      const fresh = arr.map(parseQ).filter(x => x && !have.has(x.q) && have.add(x.q));
-      offs[tag] = arr.length && fresh.length ? off + arr.length : -1; // nothing new means this tag is used up
-      got.push(...fresh);
+  const run = async (key, qs, keep) => {
+    for (let n = 0; n < 5 && offs[key] !== -1; n++) {
+      const off = offs[key] || 0, arr = await page(qs, off); if (!arr) { offs[key] = -1; break; }
+      const nw = arr.map(parseQ).filter(x => x && !have.has(x.q) && have.add(x.q));
+      offs[key] = arr.length && nw.length ? off + arr.length : -1; // nothing new means this source is used up
+      got.push(...nw.filter(x => !giveaway(x) && keep(x)));
     }
-  }
+  };
+  for (const tag of TAGS[lang]) await run(tag, 'tags=' + encodeURIComponent(tag), () => true);
+  if (KW[lang] && (offs.__fb || (!got.length && !(quizMem[lang] || []).length))) { offs.__fb = true; await run('__cat', 'category=Programming', x => KW[lang](x.q + ' ' + x.opts.join(' '))); }
   try { localStorage.setItem('cca.off3.' + lang, JSON.stringify(offs)); } catch {}
   return got;
 }
 async function getQuiz(lang, more = false) {
-  if (!quizMem[lang]) { try { quizMem[lang] = JSON.parse(localStorage.getItem('cca.q3.' + lang)) || []; } catch { quizMem[lang] = []; } if (!Array.isArray(quizMem[lang])) quizMem[lang] = []; }
+  if (!quizMem[lang]) { try { quizMem[lang] = JSON.parse(localStorage.getItem('cca.q3.' + lang)) || []; } catch { quizMem[lang] = []; } if (!Array.isArray(quizMem[lang])) quizMem[lang] = []; quizMem[lang] = quizMem[lang].filter(x => !giveaway(x)); }
   if (!quizMem[lang].length || more) {
     const got = await pull(lang); quizMem[lang] = [...quizMem[lang], ...got];
     try { localStorage.setItem('cca.q3.' + lang, JSON.stringify(quizMem[lang])); } catch {}
@@ -72,8 +84,10 @@ async function getQuiz(lang, more = false) {
 // ---------- storage ----------
 const newUser = () => ({ elo: Object.fromEntries(LANGS.map(l => [l, 1000])), stats: Object.fromEntries(LANGS.map(l => [l, { done: 0, ok: 0, ms: 0 }])),
   history: [], sessions: [], seen: [], days: [], theme: 'dark', lang: 'Python', anim: true });
+function normalizeUser(u) { u.elo ||= {}; u.stats ||= {}; u.history ||= []; u.sessions ||= []; u.seen ||= []; u.days ||= [];
+  LANGS.forEach(l => { if (typeof u.elo[l] !== 'number') u.elo[l] = 1000; if (!u.stats[l]) u.stats[l] = { done: 0, ok: 0, ms: 0 }; }); }
 function load() {
-  try { const d = JSON.parse(localStorage.getItem(KEY)); if (d?.users?.[d.current]) return d; } catch {}
+  try { const d = JSON.parse(localStorage.getItem(KEY)); if (d?.users?.[d.current]) { Object.values(d.users).forEach(normalizeUser); return d; } } catch {}
   return { current: 'Player', users: { Player: newUser() } };
 }
 let db = load();
@@ -117,8 +131,15 @@ async function sbFetch(path, opt = {}) {
   const t = await freshToken(), bearer = t || (SB.key.startsWith('eyJ') ? SB.key : '');
   return fetch(`${SB.url}/rest/v1/${path}`, { ...opt, headers: { apikey: SB.key, ...(bearer ? { Authorization: 'Bearer ' + bearer } : {}), 'Content-Type': 'application/json', ...opt.headers } });
 }
-const pushPlayer = nick => { const u = me(); return sbFetch('players?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' },
-  body: JSON.stringify({ id: auth.uid, nickname: nick, avatar: u.avatar || null, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: new Date().toISOString() }) }); };
+let noDataCol = false;
+async function pushPlayer(nick) {
+  const u = me(), ts = new Date().toISOString(); u.ts = Date.parse(ts); save();
+  const body = { id: auth.uid, nickname: nick, avatar: u.avatar || null, overall: overall(u), elos: u.elo, done: total(u, 'done'), ok: total(u, 'ok'), updated_at: ts };
+  const data = { stats: u.stats, history: u.history.slice(-200), sessions: u.sessions.slice(-100), seen: u.seen.slice(-2000), days: u.days.slice(-120), theme: u.theme, lang: u.lang, anim: u.anim };
+  const send = b => sbFetch('players?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates' }, body: JSON.stringify(b) });
+  if (!noDataCol) { const r = await send({ ...body, data }); if (r.status !== 400) return r; const t = await r.clone().text().catch(() => ''); if (!/data/i.test(t)) return r; noDataCol = true; toast('Run the new SQL in Supabase to sync full progress'); }
+  return send(body);
+}
 async function syncPlayer() {
   if (!SB || !auth) return;
   try { const r = await pushPlayer(db.current); if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text().catch(() => '')).slice(0, 120)}`); }
@@ -127,13 +148,25 @@ async function syncPlayer() {
 const RCOL = ['#94A3B8', '#34D399', '#22D3EE', '#3B82F6', '#8B5CF6', '#FBBF24'];
 const av = (src, name, cls = '') => src ? `<img class="av ${cls}" src="${esc(src)}" alt="">` : `<span class="av ${cls}">${esc((name || '?')[0].toUpperCase())}</span>`;
 const rb = i => `<span class="rb" style="--c:${RCOL[i]}">${RANKS[i][0][0]}</span>`;
+function reconcile(row) { // decides between the saved account data and this device's data: 'push', 'applied' or 'none'
+  const u = me(), cloudTs = row?.updated_at ? Date.parse(row.updated_at) : 0, done = total(u, 'done');
+  if (!row) return 'push';
+  if (row.data && cloudTs > (u.ts || 0)) { Object.assign(u, row.data); if (row.elos) Object.assign(u.elo, row.elos); if (row.avatar) u.avatar = row.avatar; normalizeUser(u); u.ts = cloudTs; save(); return 'applied'; }
+  if (!row.data) { if (done > 0 && done >= (row.done || 0)) return 'push'; if (done === 0 && row.elos) { Object.assign(u.elo, row.elos); if (row.avatar) u.avatar = row.avatar; save(); return 'applied'; } return 'none'; }
+  return (u.ts || 0) > cloudTs ? 'push' : 'none';
+}
+async function loadRow() { try { const r = await sbFetch(`players?id=eq.${auth.uid}&select=*`); const j = r.ok ? await r.json() : null; return j ? (j[0] || null) : undefined; } catch { return undefined; } }
 async function afterLogin(nickHint) {
-  let row = null;
-  try { const r = await sbFetch(`players?id=eq.${auth.uid}&select=*`); const j = r.ok ? await r.json() : []; row = j[0] || null; } catch {}
-  const nick = row?.nickname || nickHint || auth.email.split('@')[0].slice(0, 16);
-  if (!db.users[nick]) db.users[nick] = newUser(); db.current = nick; const u = me();
-  if (row?.elos && total(u, 'done') === 0) Object.assign(u.elo, row.elos);
-  if (row?.avatar) u.avatar = row.avatar; save(); if (!row) await syncPlayer(); go('dashboard');
+  const row = await loadRow(), nick = row?.nickname || nickHint || auth.email.split('@')[0].slice(0, 16);
+  if (!db.users[nick]) db.users[nick] = newUser(); db.current = nick; save();
+  if (row !== undefined && reconcile(row) === 'push') await syncPlayer();
+  go('dashboard');
+}
+async function pullCloud() { // keeps this device up to date with the account (other devices)
+  if (!auth || S) return; const row = await loadRow(); if (row === undefined || S) return;
+  if (row && row.nickname && row.nickname !== db.current && !db.users[row.nickname]) { db.users[row.nickname] = db.users[db.current]; delete db.users[db.current]; db.current = row.nickname; save(); }
+  const act = reconcile(row); if (act === 'push') await syncPlayer();
+  else if (act === 'applied') { setMe(); applyPrefs(); const v = location.hash.slice(1); if (['dashboard', 'stats', 'profile'].includes(v)) go(v); }
 }
 function authScreen() {
   document.body.classList.add('authing'); let mode = 'login';
@@ -302,7 +335,7 @@ const views = {
     $('#th').onchange = e => { u.theme = e.target.value; save(); applyPrefs(); }; $('#dl').onchange = e => { u.lang = e.target.value; save(); };
     $('#an').onchange = e => { u.anim = e.target.value === '1'; save(); applyPrefs(); };
     $('#pl')?.addEventListener('change', e => { db.current = e.target.value; save(); go('settings'); });
-    $('#rs').onclick = () => { if (confirm('Reset Elo, stats and history for this player?')) { db.users[db.current] = newUser(); save(); toast('Progress reset'); go('settings'); } };
+    $('#rs').onclick = () => { if (confirm('Reset Elo, stats and history for this player?')) { db.users[db.current] = newUser(); save(); toast('Progress reset'); syncPlayer().then(() => { boardCache = null; }); go('settings'); } };
     $('#cl').onclick = () => { if (confirm('Delete all saved data on this device?')) { Object.keys(localStorage).filter(k => k.startsWith('cca.')).forEach(k => localStorage.removeItem(k)); location.reload(); } };
   },
 };
@@ -322,16 +355,17 @@ async function begin(c, back = 'arena') {
   const filt = l => (c.tag ? l.filter(x => x.tags.includes(c.tag)) : l), isNew = x => !u.seen.includes(hash(x.q));
   try {
     qs = await getQuiz(c.lang);
-    for (let i = 0; i < 5 && !c.practice && filt(qs).filter(isNew).length < c.n; i++) { const n = qs.length; qs = await getQuiz(c.lang, true); if (qs.length === n) break; } // page for more new questions
+    for (let i = 0; i < 5 && filt(qs).filter(isNew).length < c.n; i++) { const n = qs.length; qs = await getQuiz(c.lang, true); if (qs.length === n) break; } // page for more new questions
   } catch (e) { return failure(e, () => begin(c, back)); }
   const all = filt(qs).map(x => ({ ...x, id: hash(x.q) }));
   if (!all.length) return notice('No questions for this topic', `There are no ${c.lang} questions${c.tag ? ' for "' + c.tag + '"' : ''}. Try another topic or language.`, back);
-  let pool = c.practice ? all : all.filter(isNew), repeat = '';
-  if (!c.practice && pool.length < c.n) { const old = shuffle(all.filter(x => !isNew(x))).slice(0, c.n - pool.length); if (old.length) repeat = `Includes ${old.length} you have seen before.`; pool = [...pool, ...old]; }
+  const pool = all.filter(isNew);
+  if (!pool.length) { view(`<div class="empty"><h2>You have answered them all</h2><p>No new ${esc(c.lang)} questions are left${c.tag ? ' for this topic' : ''}.</p><div class="acts" style="justify-content:center"><button class="primary" id="rst">Start over with repeats</button><button id="bk">Back</button></div></div>`);
+    $('#rst').onclick = () => { u.seen = []; save(); begin(c, back); }; $('#bk').onclick = () => go(back); return; }
   const first = shuffle(pool.filter(x => x.diff === c.diff)), items = [...first, ...shuffle(pool.filter(x => x.diff !== c.diff))].slice(0, c.n);
-  const short = items.length < c.n ? `Only ${items.length} ${c.lang}${c.tag ? ' "' + c.tag + '"' : ''} question(s) available, so this session has ${items.length}.` : '';
+  const short = items.length < c.n ? `Only ${items.length} new ${c.lang}${c.tag ? ' "' + c.tag + '"' : ''} question(s) left, so this session has ${items.length}.` : '';
   const dn = first.length >= items.length ? '' : `Some questions are ${first.length ? 'from other difficulties' : 'not ' + c.diff}.`;
-  const note = [short, dn, repeat].filter(Boolean).join(' ');
+  const note = [short, dn].filter(Boolean).join(' ');
   S = { ...c, items, i: 0, res: [], note, before: overall(u), startRank: rankIdx(overall(u)), startLang: u.elo[c.lang] }; ask();
 }
 function ask() {
@@ -357,11 +391,11 @@ function ask() {
   if (lim) timer = setInterval(() => { left--; const t = $('#tm'); if (t) { t.textContent = left; t.classList.toggle('hot', left <= 5); } if (left <= 0) settle(null); }, 1000);
 }
 function finish() {
-  if (S.practice) { const res = S.res, ok = res.filter(r => r.res === 'ok').length; S = null;
+  if (S.practice) { const res = S.res, ok = res.filter(r => r.res === 'ok').length, pu = me(); res.forEach(r => pu.seen.push(r.id)); pu.seen = pu.seen.slice(-3000); save(); S = null;
     return view(`<div class="q"><h1>Practice complete</h1><div class="grid">${stat('Correct', ok + ' / ' + res.length)}</div><h2>Review</h2><div class="card">${res.map(r => `<div class="row"><span>${esc(r.q)}</span><span class="${r.res === 'ok' ? 'ok' : 'bad'}">${r.res === 'ok' ? 'Correct' : esc(r.correct)}</span></div>`).join('')}</div><div class="acts"><button class="primary" data-go="practice">Practice again</button><button data-go="dashboard">Dashboard</button></div></div>`); }
   const u = me(), had = unlocked(u); let e = u.elo[S.lang];
   S.res.forEach(r => { e = nextElo(e, DIFF_R[r.diff], r.res === 'ok' ? 1 : 0); const s = u.stats[S.lang]; s.done++; s.ms += r.ms; if (r.res === 'ok') s.ok++; u.seen.push(r.id); });
-  u.seen = u.seen.slice(-300); u.elo[S.lang] = e; if (!u.days.includes(day())) u.days.push(day());
+  u.seen = u.seen.slice(-3000); u.elo[S.lang] = e; if (!u.days.includes(day())) u.days.push(day());
   const after = overall(u), ok = S.res.filter(r => r.res === 'ok').length, bad = S.res.filter(r => r.res === 'no').length, none = S.res.length - ok - bad;
   u.sessions.push({ d: day(), lang: S.lang, mode: S.mode, ok, items: S.res.map(r => ({ id: r.id, res: r.res })), before: S.before, after }); u.history.push({ d: day(), e: after }); save(); syncPlayer().then(() => { boardCache = null; });
   const up = rankIdx(after) > S.startRank, sum = { before: S.before, sl: S.startLang, n: S.res.length, res: S.res }; S = null; setMe();
@@ -375,4 +409,5 @@ function finish() {
 document.addEventListener('click', e => { if (e.target.closest('[data-daily]')) return begin({ mode: 'classic', lang: me().lang, diff: 'medium', n: 1 }); const g = e.target.closest('[data-go]'); if (g) go(g.dataset.go); });
 if (SB && !auth && !localStorage.getItem('cca.guest')) authScreen();
 else go(Object.keys(VIEWS).includes(location.hash.slice(1)) ? location.hash.slice(1) : 'dashboard');
-if (auth) freshToken().then(t => { if (!t) location.reload(); });
+if (auth) freshToken().then(t => { if (!t) location.reload(); else pullCloud(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pullCloud(); });
